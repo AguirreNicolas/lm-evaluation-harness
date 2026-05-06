@@ -7,9 +7,11 @@ import os
 import random
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+from tqdm import tqdm
 
 import lm_eval.api.model
 import lm_eval.api.registry
@@ -629,12 +631,48 @@ def evaluate(
                 world_size=WORLD_SIZE,
                 samples=indices,
             )
-            for doc_id, doc in doc_iterator:
+            doc_list = list(doc_iterator)
+            n_workers = int(os.environ.get("LMEVAL_NUM_WORKERS", 1)) or None
+            n_iter = len(task.eval_docs)
+            if limit is not None:
+                n_iter = limit
+            eval_logger.info(f"Processing docs for {task_name}...")
+            if n_workers == 1:
+                # Default to single thread
+                all_metrics = list(
+                    tqdm(
+                        (
+                            task.process_results(
+                                doc,
+                                [req.filtered_resps[filter_key] for req in instances_by_doc_id[doc_id]]
+                            )
+                            for doc_id, doc in doc_list
+                        ),
+                        total=n_iter,
+                        desc=f"{task_name}",
+                    )
+                )
+            else:
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    all_metrics = list(
+                        tqdm(
+                            pool.map(
+                                lambda args, _task=task, _fk=filter_key, _ibdi=instances_by_doc_id: _task.process_results(
+                                    args[1],
+                                    [
+                                        req.filtered_resps[_fk]
+                                        for req in _ibdi[args[0]]
+                                    ],
+                                ),
+                                doc_list,
+                            ),
+                            total=n_iter,
+                            desc=f"{task_name}",
+                        )
+                    )
+            for (doc_id, doc), metrics in zip(doc_list, all_metrics, strict=True):
                 doc_id_true = indices[doc_id] if indices else doc_id
                 requests = instances_by_doc_id[doc_id]
-                metrics = task.process_results(
-                    doc, [req.filtered_resps[filter_key] for req in requests]
-                )
                 if log_samples:
                     target = task.doc_to_target(doc)
                     example = {
